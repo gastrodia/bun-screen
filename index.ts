@@ -186,7 +186,7 @@ class Share {
 
 
   async start() {
-    Bun.serve<string>({
+    return Bun.serve<string>({
       port: this.port,
       fetch: async (request, server) => {
         const path = new URL(request.url).pathname
@@ -274,4 +274,4 @@ class Share {
 }
 
 const share = new Share()
-await share.start()
+export default share.start()
