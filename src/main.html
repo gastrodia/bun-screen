@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+        }
+
+        .container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px;
+            border-bottom: 1px solid #ccc;
+            align-items: center;
+        }
+
+        .header h1 {
+            margin: 0;
+        }
+
+        .header-main {
+            flex: 1;
+        }
+
+        .header-main button {
+            padding: 5px 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+
+        .main {
+            margin-top: 10px;
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        #preview {
+            flex: 1;
+            border: 1px solid #ccc;
+            overflow: hidden;
+        }
+
+        .message {
+            width: 300px;
+            border: 1px solid #ccc;
+            margin: 0 0 0 10px;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .message-list {
+            padding: 0 0 0 24px;
+            margin: 0;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        #danmaku {
+            display: flex;
+            padding: 10px;
+            border-top: 1px solid #ccc;
+        }
+
+        #danmaku input {
+            flex: 1;
+            padding: 5px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+
+        #danmaku button {
+            padding: 5px 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1 id="title"></h1>
+        <div class="header-main">
+            <button id="button">开始共享</button>
+            <button id="share-link">分享房间</button>
+        </div>
+    </div>
+    <div class="main">
+        <video id="preview"></video>
+        <div class="message">
+            <ul class="message-list"></ul>
+            <form id="danmaku">
+                <input type="text" placeholder="请输入消息">
+                <button type="submit">发送</button>
+            </form>
+        </div>
+    </div>
+</div>
+</body>
+<script>
+    class Main {
+        constructor() {
+            const params = new URLSearchParams(location.search)
+            const url = new URL(location.href)
+            this.preview = document.getElementById('preview')
+            this.socketUrl = 'ws://localhost:3000/ws'
+            this.title = document.getElementById('title')
+            this.button = document.getElementById('button')
+            this.shareButton = document.getElementById('share-link')
+            this.messageContainer = document.querySelector('.message-list')
+            this.socket = null
+            this.roomId = params.get('id') || this.generateClientId()
+            this.roomName = params.get('name') || ''
+            this.isSharing = false
+            this.stream = null
+            this.peers = new Map
+            this.cover = ''
+            this.danmaku = document.getElementById('danmaku')
+        }
+
+        start() {
+            this.inputRoomName()
+            this.registerEvent()
+        }
+
+        messageHandler = {
+            joined: async (data) => {
+                console.log('join')
+                const li = document.createElement('li')
+                li.textContent = `欢迎 ${data.username}(${data.userId}) 加入房间`
+                this.setMessage(li)
+
+                // 给新加入的用户发送offer
+                const peer = new RTCPeerConnection()
+                this.stream.getTracks().forEach(track => peer.addTrack(track, this.stream))
+                peer.onicecandidate = (e) => {
+                    if (e.candidate) {
+                        this.sendMessage('icecandidate', {
+                            candidate: e.candidate,
+                            userId: data.userId,
+                            roomId: this.roomId
+                        })
+                    }
+                }
+
+                const offer = await peer.createOffer()
+                await peer.setLocalDescription(offer)
+                this.sendMessage('offer', {
+                    offer,
+                    userId: data.userId,
+                    roomId: this.roomId
+                })
+
+                this.peers.set(data.userId, peer)
+            },
+            leave: (data) => {
+                console.log('leave')
+                const li = document.createElement('li')
+                li.classList.add('leave')
+                li.textContent = `${data.username}(${data.userId}) 离开房间`
+                this.setMessage(li)
+            },
+            answer: async (data) => {
+                console.log('answer')
+                const {answer, userId} = data
+                const peer = this.peers.get(userId)
+                await peer.setRemoteDescription(answer)
+            },
+            icecandidate: (data) => {
+                console.log('icecandidate')
+                const {candidate, userId} = data
+                const peer = this.peers.get(userId)
+                peer.addIceCandidate(new RTCIceCandidate(candidate))
+            },
+            danmaku: (data) => {
+                const li = document.createElement('li')
+                const possessor = document.createElement('label')
+                const {roomId, admin, message, username, userId} = data
+                let part = ''
+                if (admin) part = '我'
+                else part = `${username}(${userId})`
+                possessor.textContent = `${part}说：`
+                const content = document.createElement('span')
+                content.textContent = message
+                li.appendChild(possessor)
+                li.appendChild(content)
+                this.setMessage(li)
+            }
+        }
+
+        sendMessage(type, data) {
+            this.socket.send(JSON.stringify({
+                type,
+                data
+            }))
+        }
+
+        generateClientId() {
+            return Math.random().toString().substring(2, 9)
+        }
+
+        inputRoomName() {
+            while (!this.roomName) {
+                this.roomName = prompt('请输入')
+            }
+            this.title.textContent = `hi, ${this.roomName}(${this.roomId})`
+            const params = new URLSearchParams({
+                id: this.roomId,
+                name: this.roomName
+            })
+            history.pushState(null, '', `?${params}`)
+        }
+
+        registerEvent() {
+            this.button.addEventListener('click', this.buttonClick.bind(this))
+            this.danmaku.addEventListener('submit', this.danmakuSubmit.bind(this))
+            this.shareButton.addEventListener('click', () => {
+                const url = new URL(`${location.origin}/src/watch.html`)
+                url.searchParams.set('id', this.roomId)
+                url.searchParams.set('name', this.roomName)
+                navigator.clipboard.writeText(url.href)
+            })
+        }
+
+        async buttonClick() {
+            this.isSharing ? await this.stopShare() : await this.startShare()
+        }
+
+        async stopShare() {
+            if (!this.stream) return
+            this.stream.getTracks().forEach(track => track.stop())
+            this.stream = null
+            await this.preview.pause()
+            this.preview.srcObject = null
+            this.socket?.close()
+            this.socket = null
+            this.peers.forEach(peer => peer.close())
+            this.peers.clear()
+
+            const li = document.createElement('li')
+            li.textContent = `房间 ${this.roomName}(${this.roomId}) 已关闭`
+            this.setMessage(li)
+
+            this.isSharing = false
+            this.button.textContent = '开始共享'
+        }
+
+        async startShare() {
+            this.stream = await navigator.mediaDevices.getDisplayMedia({
+                video: true,
+                audio: false
+            })
+
+            this.stream.getTracks().forEach(track => {
+                track.onended = this.stopShare.bind(this)
+            })
+
+            this.preview.srcObject = this.stream
+            await this.preview.play()
+
+            // 获取第一帧作为封面
+            const canvas = document.createElement('canvas')
+            const ctx = canvas.getContext('2d')
+            canvas.width = this.preview.videoWidth
+            canvas.height = this.preview.videoHeight
+            ctx.drawImage(this.preview, 0, 0, canvas.width, canvas.height)
+            this.cover = canvas.toDataURL('image/png')
+
+            this.socket = new WebSocket(this.socketUrl)
+            this.socket.onopen = this.socketOnOpen.bind(this)
+            this.socket.onmessage = this.socketOnMessage.bind(this)
+            this.socket.onerror = this.socketOnError.bind(this)
+            this.socket.onclose = this.socketOnClose.bind(this)
+
+            const li = document.createElement('li')
+            li.textContent = `房间 ${this.roomName}(${this.roomId}) 已创建`
+            this.setMessage(li)
+
+            this.isSharing = true
+            this.button.textContent = '停止共享'
+        }
+
+        socketOnOpen() {
+            this.sendMessage('create', {
+                roomId: this.roomId,
+                roomName: this.roomName,
+                cover: this.cover
+            })
+        }
+
+        socketOnMessage(e) {
+            const payload = JSON.parse(e.data)
+            const {data, type} = payload
+            this.messageHandler[type](data)
+        }
+
+        socketOnError() {
+        }
+
+        socketOnClose() {
+            this.stopShare()
+        }
+
+        setMessage(li) {
+            this.messageContainer.appendChild(li)
+            this.messageContainer.scrollTop = this.messageContainer.scrollHeight
+        }
+
+        danmakuSubmit(e) {
+            e.preventDefault()
+            if (!this.socket) return
+            const input = this.danmaku.querySelector('input')
+            const message = input.value
+            if (!message) return
+            this.sendMessage('danmaku', {
+                message,
+                roomId: this.roomId,
+                admin: true
+            })
+            input.value = ''
+        }
+    }
+
+    const main = new Main()
+    main.start()
+</script>
+</html>
