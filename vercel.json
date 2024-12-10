@@ -10,10 +10,5 @@
   ],
   "env": {
     "BUN_BIN": "/opt/bun"
-  },
-  "functions": {
-    "index.ts": {
-      "runtime": "vercel-node"
-    }
   }
 }
