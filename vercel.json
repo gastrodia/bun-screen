@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "index.ts",
+      "use": "@vercel/node",
+      "config": {
+        "maxLambdaSize": "50mb"
+      }
+    }
+  ],
+  "env": {
+    "BUN_BIN": "/opt/bun"
+  }
+}
