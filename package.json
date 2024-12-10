@@ -5,6 +5,9 @@
   "scripts": {
     "start": "bun run index.ts"
   },
+  "dependencies": {
+    "bun": "latest"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
