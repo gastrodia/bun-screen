@@ -19,7 +19,7 @@ class Share {
   constructor() {
   }
 
-  port = 443;
+  port = 3000;
 
   messageHandlers: Partial<Record<
     MessageKeys,
