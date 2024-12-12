@@ -1,6 +1,13 @@
 {
   "name": "bun-screen",
   "module": "index.ts",
+  "scripts": {
+    "dev": "bun run index.ts",
+    "start": "bun run index.ts"
+  },
+  "dependencies": {
+    "bun": "latest"
+  }
   "devDependencies": {
     "@types/bun": "latest"
   },
