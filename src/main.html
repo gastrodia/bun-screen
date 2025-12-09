@@ -121,7 +121,8 @@
             const params = new URLSearchParams(location.search)
             const url = new URL(location.href)
             this.preview = document.getElementById('preview')
-            this.socketUrl = `ws://${url.host}/ws`
+            const wsProtocol = url.protocol === 'https:' ? 'wss' : 'ws'
+            this.socketUrl = `${wsProtocol}://${url.host}/ws`
             this.title = document.getElementById('title')
             this.button = document.getElementById('button')
             this.shareButton = document.getElementById('share-link')
@@ -134,6 +135,12 @@
             this.peers = new Map
             this.cover = ''
             this.danmaku = document.getElementById('danmaku')
+            this.manualClose = false
+            this.rtcConfig = {
+                iceServers: [
+                    {urls: 'stun:stun.l.google.com:19302'}
+                ]
+            }
         }
 
         start() {
@@ -149,7 +156,7 @@
                 this.setMessage(li)
 
                 // 给新加入的用户发送offer
-                const peer = new RTCPeerConnection()
+                const peer = new RTCPeerConnection(this.rtcConfig)
                 this.stream.getTracks().forEach(track => peer.addTrack(track, this.stream))
                 peer.onicecandidate = (e) => {
                     if (e.candidate) {
@@ -177,17 +184,24 @@
                 li.classList.add('leave')
                 li.textContent = `${data.username}(${data.userId}) 离开房间`
                 this.setMessage(li)
+                const peer = this.peers.get(data.userId)
+                if (peer) {
+                    peer.close()
+                    this.peers.delete(data.userId)
+                }
             },
             answer: async (data) => {
                 console.log('answer')
                 const {answer, userId} = data
                 const peer = this.peers.get(userId)
+                if (!peer) return
                 await peer.setRemoteDescription(answer)
             },
             icecandidate: (data) => {
                 console.log('icecandidate')
                 const {candidate, userId} = data
                 const peer = this.peers.get(userId)
+                if (!peer) return
                 peer.addIceCandidate(new RTCIceCandidate(candidate))
             },
             danmaku: (data) => {
@@ -207,6 +221,12 @@
         }
 
         sendMessage(type, data) {
+            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+                const li = document.createElement('li')
+                li.textContent = '连接未就绪，无法发送消息'
+                this.setMessage(li)
+                return
+            }
             this.socket.send(JSON.stringify({
                 type,
                 data
@@ -236,7 +256,16 @@
                 const url = new URL(`${location.origin}/src/watch.html`)
                 url.searchParams.set('id', this.roomId)
                 url.searchParams.set('name', this.roomName)
-                navigator.clipboard.writeText(url.href)
+                navigator.clipboard.writeText(url.href).catch(() => {
+                    const li = document.createElement('li')
+                    li.textContent = '复制分享链接失败，请手动复制地址栏'
+                    this.setMessage(li)
+                })
+            })
+            window.addEventListener('beforeunload', () => {
+                if (this.isSharing) {
+                    this.stopShare()
+                }
             })
         }
 
@@ -245,11 +274,14 @@
         }
 
         async stopShare() {
+            // 避免重复清理（手动关闭 + onclose 回调）
+            if (this.manualClose) return
             if (!this.stream) return
             this.stream.getTracks().forEach(track => track.stop())
             this.stream = null
             await this.preview.pause()
             this.preview.srcObject = null
+            this.manualClose = true
             this.socket?.close()
             this.socket = null
             this.peers.forEach(peer => peer.close())
@@ -264,17 +296,28 @@
         }
 
         async startShare() {
-            this.stream = await navigator.mediaDevices.getDisplayMedia({
-                video: true,
-                audio: false
-            })
+            try {
+                this.stream = await navigator.mediaDevices.getDisplayMedia({
+                    video: true,
+                    audio: false
+                })
+            } catch (err) {
+                const li = document.createElement('li')
+                li.textContent = '未授权或取消屏幕共享'
+                this.setMessage(li)
+                return
+            }
 
             this.stream.getTracks().forEach(track => {
                 track.onended = this.stopShare.bind(this)
             })
 
             this.preview.srcObject = this.stream
-            await this.preview.play()
+            await this.preview.play().catch(() => {
+                const li = document.createElement('li')
+                li.textContent = '自动播放被阻止，请手动点击播放'
+                this.setMessage(li)
+            })
 
             // 获取第一帧作为封面
             const canvas = document.createElement('canvas')
@@ -309,13 +352,24 @@
         socketOnMessage(e) {
             const payload = JSON.parse(e.data)
             const {data, type} = payload
-            this.messageHandler[type](data)
+            const handler = this.messageHandler[type]
+            if (!handler) return
+            handler(data)
         }
 
         socketOnError() {
+            const li = document.createElement('li')
+            li.textContent = '连接异常，已尝试关闭共享'
+            this.setMessage(li)
+            this.stopShare()
         }
 
         socketOnClose() {
+            if (this.manualClose) {
+                // 手动关闭触发的 onclose，仅重置标记
+                this.manualClose = false
+                return
+            }
             this.stopShare()
         }
 
@@ -328,7 +382,7 @@
             e.preventDefault()
             if (!this.socket) return
             const input = this.danmaku.querySelector('input')
-            const message = input.value
+            const message = input.value.trim()
             if (!message) return
             this.sendMessage('danmaku', {
                 message,

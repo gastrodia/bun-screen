@@ -1,4 +1,3 @@
-import Bun from 'bun';
 import type {ServerWebSocket} from 'bun';
 
 type MessageKeys =
@@ -19,7 +18,7 @@ class Share {
   constructor() {
   }
 
-  port = process?.env?.PORT || 3000;
+  port = Bun?.env?.PORT || 3000;
 
   messageHandlers: Partial<Record<
     MessageKeys,
@@ -29,13 +28,10 @@ class Share {
       // 有用户加入房间
       const {roomId, userId, username} = payload;
 
-      this.users.set(userId, {
-        ws,
-        name: username,
-        roomId
-      })
-
-      if (!roomId) return;
+      if (!roomId || !userId) {
+        this.sendMessage(ws, 'error', {message: '房间或用户信息缺失'})
+        return
+      }
 
       const room = this.rooms.get(roomId);
 
@@ -48,11 +44,13 @@ class Share {
 
       this.users.set(userId, {
         ws,
-        name: username,
+        name: username || '匿名用户',
         roomId
       })
 
-      room.clients.push(ws)
+      if (!room.clients.includes(ws)) {
+        room.clients.push(ws)
+      }
 
       this.sendMessage(room.host, 'joined', {
         userId,
@@ -66,6 +64,14 @@ class Share {
     },
     create: (ws, payload) => {
       const {roomId, roomName, cover} = payload;
+      if (!roomId || !roomName) {
+        this.sendMessage(ws, 'error', {message: '房间信息不完整'})
+        return
+      }
+      if (this.rooms.has(roomId)) {
+        this.sendMessage(ws, 'error', {message: '房间已存在'})
+        return
+      }
       this.rooms.set(roomId, {
         host: ws,
         name: roomName,
@@ -74,7 +80,7 @@ class Share {
       })
 
       // 通知所有用户 有新房间
-      for (const [userId, user] of this.users) {
+      for (const [, user] of this.users) {
         const {ws: userWs} = user;
         this.sendMessage(userWs, 'updateRooms', {
           roomId,
@@ -102,7 +108,7 @@ class Share {
     answer: (ws, payload) => {
       const {answer, userId, roomId} = payload
       const room = this.rooms.get(roomId);
-      if (!room) {
+      if (!room || !room.host) {
         this.sendMessage(ws, 'error', {
           message: '房间不存在'
         })
@@ -184,6 +190,17 @@ class Share {
     }))
   }
 
+  safeParse(message: string) {
+    try {
+      return JSON.parse(message) as {
+        type: MessageKeys;
+        data: Record<string, any>;
+      }
+    } catch (e) {
+      return null
+    }
+  }
+
 
   async start() {
     Bun.serve<string>({
@@ -209,17 +226,17 @@ class Share {
             return new Response(JSON.stringify(this.roomData))
           }
         }
-        return new Response(path);
+        return new Response('Not Found', {status: 404});
       },
       websocket: {
         open() {
         },
-        close: (ws, code, reason) => {
+        close: (ws, _code, _reason) => {
           // 用户离开 或者 关闭房间
           // 判断是用户离开还是关闭房间
           // 1. 如果从用户列表中找到用户，说明是用户离开 则需要通知房间内的其他用户 和 房主
           // 2. 如果从房间列表中找到房间，说明是房主关闭房间，则需要通知房间内的其他用户
-          const user = Array.from(this.users).find(([userId, user]) => user.ws === ws);
+          const user = Array.from(this.users).find(([, user]) => user.ws === ws);
           if (user) {
             const [userId, {ws, roomId, name}] = user;
             const room = this.rooms.get(roomId);
@@ -248,7 +265,7 @@ class Share {
             this.rooms.delete(roomId)
 
             // 通知所有用户 有房间关闭
-            for (const [userId, user] of this.users) {
+            for (const [, user] of this.users) {
               const {ws: userWs} = user;
               this.sendMessage(userWs, 'updateRooms', {
                 roomId,
@@ -258,14 +275,19 @@ class Share {
           }
         },
         message: (ws, message: string) => {
-          const payload: {
-            type: MessageKeys;
-            data: Record<string, any>;
-          } = JSON.parse(message);
+          const payload = this.safeParse(message);
+          if (!payload) {
+            this.sendMessage(ws, 'error', {message: '消息格式错误'})
+            return
+          }
           const {type, data} = payload;
 
           const handler = this.messageHandlers[type];
-          handler?.(ws, data)
+          if (!handler) {
+            this.sendMessage(ws, 'error', {message: '不支持的消息类型'})
+            return
+          }
+          handler(ws, data)
         }
       },
     })

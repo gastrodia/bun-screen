@@ -128,12 +128,18 @@
             this.title = document.getElementById('title')
             this.messageContainer = document.querySelector('.message-list')
             this.socket = null
-            this.socketUrl = `ws://${url.host}/ws`
+            const wsProtocol = url.protocol === 'https:' ? 'wss' : 'ws'
+            this.socketUrl = `${wsProtocol}://${url.host}/ws`
             this.roomContainer = document.querySelector('.room-list')
             this.peer = null
             this.username = params.get('uname')
             this.userId = params.get('uid') || this.generateClientId()
             this.danmaku = document.getElementById('danmaku')
+            this.rtcConfig = {
+                iceServers: [
+                    {urls: 'stun:stun.l.google.com:19302'}
+                ]
+            }
         }
 
         get roomId() {
@@ -150,6 +156,12 @@
         messageHandler = {
             offer: async (data) => {
                 const {offer} = data
+                if (!this.peer) {
+                    const li = document.createElement('li')
+                    li.textContent = '连接尚未准备好，无法处理 offer'
+                    this.setMessage(li)
+                    return
+                }
                 await this.peer.setRemoteDescription(offer)
                 const answer = await this.peer.createAnswer()
                 await this.peer.setLocalDescription(answer)
@@ -177,10 +189,10 @@
                 li.textContent = e.message
                 this.setMessage(li)
 
-                this.video.srcObject?.getTracks().forEach(track => track.stop())
-                this.peer.close()
+                this.cleanupConnections(false)
             },
             icecandidate: async (data) => {
+                if (!this.peer) return
                 await this.peer.addIceCandidate(data.candidate)
             },
             updateRooms: (data) => {
@@ -211,7 +223,13 @@
             this.inputUsername()
             this.registerEvent()
             await this.getRoom()
-            await this.enterRoom()
+            if (this.roomId) {
+                await this.enterRoom()
+            } else {
+                const li = document.createElement('li')
+                li.textContent = '请选择房间后再进入'
+                this.setMessage(li)
+            }
         }
 
         setMessage(li) {
@@ -235,34 +253,44 @@
         }
 
         async getRoom() {
-            const res = await fetch('/api/rooms')
-            const rooms = await res.json()
-            this.roomContainer.innerHTML = ''
-            const fragment = document.createDocumentFragment()
-            for (const room of rooms) {
-                const li = document.createElement('li')
-                const a = document.createElement('a')
-                const params = new URLSearchParams({
-                    id: room.id,
-                    uid: this.userId,
-                    uname: this.username
-                })
+            try {
+                const res = await fetch('/api/rooms')
+                if (!res.ok) throw new Error('fetch rooms failed')
+                const rooms = await res.json()
+                this.roomContainer.innerHTML = ''
+                const fragment = document.createDocumentFragment()
+                for (const room of rooms) {
+                    const li = document.createElement('li')
+                    const a = document.createElement('a')
+                    const params = new URLSearchParams({
+                        id: room.id,
+                        uid: this.userId,
+                        uname: this.username
+                    })
 
-                const cover = document.createElement('img')
-                cover.src = room.cover
-                a.href = `?${params}`
-                a.textContent = `${room.name}(${room.id})的房间`
-                li.appendChild(cover)
-                li.appendChild(a)
-                fragment.appendChild(li)
+                    const cover = document.createElement('img')
+                    cover.src = room.cover
+                    a.href = `?${params}`
+                    a.textContent = `${room.name}(${room.id})的房间`
+                    li.appendChild(cover)
+                    li.appendChild(a)
+                    fragment.appendChild(li)
+                }
+                this.roomContainer.appendChild(fragment)
+            } catch (err) {
+                const li = document.createElement('li')
+                li.textContent = '房间列表获取失败，请稍后重试'
+                this.setMessage(li)
             }
-            this.roomContainer.appendChild(fragment)
         }
 
         async enterRoom() {
             // if (!this.roomId) return
+            this.cleanupConnections()
             this.socket = new WebSocket(this.socketUrl)
-            this.peer = new RTCPeerConnection()
+            this.peer = new RTCPeerConnection(this.rtcConfig)
+            // 确保协商时有可接收的媒体描述
+            this.peer.addTransceiver('video', {direction: 'recvonly'})
             this.peer.ontrack = (e) => {
                 this.video.srcObject = e.streams[0]
                 this.video.play().catch(this.play.bind(this))
@@ -280,6 +308,7 @@
             this.socket.onopen = this.socketOnOpen.bind(this)
             this.socket.onmessage = this.socketOnMessage.bind(this)
             this.socket.onerror = this.socketOnError.bind(this)
+            this.socket.onclose = this.socketOnClose.bind(this)
         }
 
         // 手动点击播放
@@ -311,10 +340,18 @@
         socketOnMessage(e) {
             const payload = JSON.parse(e.data)
             const {data, type} = payload
-            this.messageHandler[type](data)
+            const handler = this.messageHandler[type]
+            if (!handler) return
+            handler(data)
         }
 
         sendMessage(type, data) {
+            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+                const li = document.createElement('li')
+                li.textContent = '连接未就绪，消息未发送'
+                this.setMessage(li)
+                return
+            }
             this.socket.send(JSON.stringify({
                 type,
                 data
@@ -322,8 +359,30 @@
         }
 
         socketOnError() {
+            this.cleanupConnections()
+            const li = document.createElement('li')
+            li.textContent = '连接异常，已退出房间'
+            this.setMessage(li)
+        }
+
+        socketOnClose() {
+            this.cleanupConnections(false)
+            const li = document.createElement('li')
+            li.textContent = '房间连接已关闭'
+            this.setMessage(li)
+        }
+
+        cleanupConnections(closeSocket = true) {
             this.video.srcObject?.getTracks().forEach(track => track.stop())
-            this.peer.close()
+            this.video.srcObject = null
+            if (this.peer) {
+                this.peer.close()
+                this.peer = null
+            }
+            if (closeSocket && this.socket) {
+                this.socket.close()
+            }
+            this.socket = null
         }
 
         registerEvent() {
@@ -334,7 +393,7 @@
             e.preventDefault()
             if (!this.socket) return
             const input = this.danmaku.querySelector('input')
-            const message = input.value
+            const message = input.value.trim()
             if (!message) return
             this.sendMessage('danmaku', {
                 message,
