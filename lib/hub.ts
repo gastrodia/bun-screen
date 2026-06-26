@@ -23,10 +23,29 @@ const g = globalThis as unknown as {
   __sub?: Redis
   __routes?: Map<string, Set<Sender>>
   __subInit?: boolean
+  __errInit?: boolean
 }
 
-const pub = (g.__pub ??= new Redis(url))
-const sub = (g.__sub ??= new Redis(url))
+// Serverless 友好的连接参数：
+//   - maxRetriesPerRequest: 不再用默认的 20 次离线重试（连不上时会卡成
+//     MaxRetriesPerRequestError），改为请求级快速失败/不限制，配合 connectTimeout。
+//   - enableReadyCheck: false —— Upstash 不需要，省一次往返。
+//   - connectTimeout —— 连不上时尽快暴露真实错误，而不是闷在重试里。
+//   - 监听 error，把真正的连接错误打到日志（否则只看到 MaxRetriesPerRequestError）。
+const redisOptions = {
+  maxRetriesPerRequest: 3,
+  enableReadyCheck: false,
+  connectTimeout: 10000,
+} as const
+
+const pub = (g.__pub ??= new Redis(url, redisOptions))
+const sub = (g.__sub ??= new Redis(url, redisOptions))
+
+if (!g.__errInit) {
+  g.__errInit = true
+  pub.on('error', (e) => console.error('[redis pub]', e?.message || e))
+  sub.on('error', (e) => console.error('[redis sub]', e?.message || e))
+}
 
 // channel -> 本实例上关心该频道的 socket 集合
 const routes = (g.__routes ??= new Map<string, Set<Sender>>())
