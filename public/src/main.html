@@ -219,6 +219,9 @@
 
         async offerTo(userId) {
             if (!this.stream) return
+            // 观众刷新后会就同一 userId 重新协商，先关掉那条已失效的旧连接
+            const stale = this.peers.get(userId)
+            if (stale) stale.close()
             const peer = new RTCPeerConnection(this.rtcConfig)
             this.peers.set(userId, peer)
             this.stream.getTracks().forEach(track => peer.addTrack(track, this.stream))

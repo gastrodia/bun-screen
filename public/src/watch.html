@@ -141,6 +141,9 @@
             this.socketUrl = buildWsUrl()
             this.roomContainer = document.querySelector('.room-list')
             this.peer = null
+            // 当前 peer 是否需要主播重新发 offer：
+            // 新建/刷新页面后的 peer 为 true；静默重连（沿用旧 peer，P2P 仍在）为 false
+            this.needOffer = false
             this.username = params.get('uname')
             this.userId = params.get('uid') || generateClientId()
             this.danmaku = document.getElementById('danmaku')
@@ -175,6 +178,8 @@
                 flushIceCandidates(this.peer)
                 const answer = await this.peer.createAnswer()
                 await this.peer.setLocalDescription(answer)
+                // 已收到 offer 并完成协商，重连时无需再请求 offer
+                this.needOffer = false
                 this.sendMessage('answer', {
                     answer,
                     userId: this.userId,
@@ -281,6 +286,8 @@
 
         // 建立 RTCPeerConnection（媒体流不随信令断开而拆除，故与 socket 分开）
         createPeer() {
+            // 全新 peer：必须让主播重新发 offer 才能拿到媒体（刷新页面即走这里）
+            this.needOffer = true
             this.peer = new RTCPeerConnection(this.rtcConfig)
             // 确保协商时有可接收的媒体描述
             this.peer.addTransceiver('video', {direction: 'recvonly'})
@@ -351,7 +358,8 @@
             this.sendMessage('join', {
                 roomId: this.roomId,
                 userId: this.userId,
-                username: this.username
+                username: this.username,
+                needOffer: this.needOffer
             })
             this.startHeartbeat()
         }

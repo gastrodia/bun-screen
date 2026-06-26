@@ -69,7 +69,7 @@ class Share {
     },
 
     join: (ws, payload) => {
-      const {roomId, userId, username} = payload
+      const {roomId, userId, username, needOffer} = payload
       if (!roomId || !userId) {
         return this.sendMessage(ws, 'error', {message: '房间或用户信息缺失'})
       }
@@ -83,8 +83,9 @@ class Share {
       this.users.set(userId, {ws, name: username || '匿名用户', roomId})
       room.clients.add(ws)
 
-      // 仅首次进入通知主播发 offer；重连续期不重复协商
-      if (!resumed) this.sendMessage(room.host, 'joined', {userId, username})
+      // 首次进入，或客户端持有全新 peer（刷新页面）都需主播发 offer；
+      // 仅静默重连且 peer 仍在时跳过协商
+      if (!resumed || needOffer) this.sendMessage(room.host, 'joined', {userId, username})
       this.sendMessage(ws, 'success', {message: `加入房间 ${room.name} 成功`})
     },
 

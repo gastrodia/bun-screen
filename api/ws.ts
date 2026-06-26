@@ -92,7 +92,7 @@ export function GET() {
 
         // 观众进入 / 重连续期
         case 'join': {
-          const {roomId, userId, username} = data
+          const {roomId, userId, username, needOffer} = data
           if (!roomId || !userId) return send(ws, 'error', {message: '房间或用户信息缺失'})
           const name = username || '匿名用户'
           m.role = 'viewer'
@@ -104,8 +104,9 @@ export function GET() {
           if (!(await roomExists(roomId))) return send(ws, 'error', {message: '房间不存在或已关闭'})
           listen(ws, channels.roomAll(roomId))
           const {resumed} = await joinRoom(roomId, userId, name)
-          // 仅「首次进入」通知主播发 offer；重连续期不重复协商（P2P 仍在）
-          if (!resumed) publish(channels.roomHost(roomId), 'joined', {userId, username: name})
+          // 首次进入，或客户端持有全新 peer（刷新页面后 needOffer=true）都要主播重发 offer；
+          // 仅「静默重连且 peer 仍在」(resumed && !needOffer) 才跳过协商。
+          if (!resumed || needOffer) publish(channels.roomHost(roomId), 'joined', {userId, username: name})
           send(ws, 'success', {message: '加入房间成功'})
           break
         }
