@@ -14,6 +14,10 @@ type MessageType =
   | 'joined'
   | 'danmaku'
   | 'updateRooms'
+  | 'heartbeat'
+  | 'closeRoom'
+  | 'leaveRoom'
+  | 'roster'
 
 type Socket = ServerWebSocket<undefined>
 
@@ -21,6 +25,7 @@ interface Room {
   host: Socket
   name: string
   cover?: string
+  hostToken?: string
   clients: Set<Socket>
 }
 
@@ -42,15 +47,25 @@ class Share {
 
   messageHandlers: Partial<Record<MessageType, (ws: Socket, payload: Record<string, any>) => void>> = {
     create: (ws, payload) => {
-      const {roomId, roomName, cover} = payload
+      const {roomId, roomName, cover, hostToken} = payload
       if (!roomId || !roomName) {
         return this.sendMessage(ws, 'error', {message: '房间信息不完整'})
       }
-      if (this.rooms.has(roomId)) {
+      const existing = this.rooms.get(roomId)
+      if (existing) {
+        // 同一主播重连续期（hostToken 一致）：刷新 host socket，不重复广播
+        if (existing.hostToken && existing.hostToken === hostToken) {
+          existing.host = ws
+          const viewers = Array.from(this.users)
+            .filter(([, u]) => u.roomId === roomId)
+            .map(([userId, u]) => ({userId, username: u.name}))
+          return this.sendMessage(ws, 'roster', {viewers})
+        }
         return this.sendMessage(ws, 'error', {message: '房间已存在'})
       }
-      this.rooms.set(roomId, {host: ws, name: roomName, cover, clients: new Set()})
+      this.rooms.set(roomId, {host: ws, name: roomName, cover, hostToken, clients: new Set()})
       this.broadcastRooms(roomId, 'create')
+      this.sendMessage(ws, 'roster', {viewers: []})
     },
 
     join: (ws, payload) => {
@@ -64,11 +79,34 @@ class Share {
         return this.sendMessage(ws, 'error', {message: '房间不存在或已关闭'})
       }
 
+      const resumed = this.users.has(userId)
       this.users.set(userId, {ws, name: username || '匿名用户', roomId})
       room.clients.add(ws)
 
-      this.sendMessage(room.host, 'joined', {userId, username})
+      // 仅首次进入通知主播发 offer；重连续期不重复协商
+      if (!resumed) this.sendMessage(room.host, 'joined', {userId, username})
       this.sendMessage(ws, 'success', {message: `加入房间 ${room.name} 成功`})
+    },
+
+    heartbeat: () => {
+      // 本地单机无回收，心跳无需续期，忽略即可
+    },
+
+    closeRoom: (ws, payload) => {
+      const {roomId} = payload
+      const room = roomId ? this.rooms.get(roomId) : undefined
+      if (room) this.closeRoomById(roomId)
+    },
+
+    leaveRoom: (ws, payload) => {
+      const {roomId, userId} = payload
+      const room = roomId ? this.rooms.get(roomId) : undefined
+      const user = userId ? this.users.get(userId) : undefined
+      if (room && user) {
+        room.clients.delete(user.ws)
+        this.users.delete(userId)
+        this.sendMessage(room.host, 'leave', {userId, username: user.name, message: `${user.name}(${userId}) 离开房间`})
+      }
     },
 
     // 主播 → 指定观众
@@ -185,6 +223,19 @@ class Share {
       this.broadcastRooms(roomId, 'close')
       return
     }
+  }
+
+  closeRoomById(roomId: string) {
+    const room = this.rooms.get(roomId)
+    if (!room) return
+    for (const client of room.clients) {
+      this.sendMessage(client, 'close', {roomId, roomName: room.name, message: `房间 ${room.name}(${roomId}) 已关闭`})
+    }
+    for (const [userId, user] of this.users) {
+      if (user.roomId === roomId) this.users.delete(userId)
+    }
+    this.rooms.delete(roomId)
+    this.broadcastRooms(roomId, 'close')
   }
 
   async start() {

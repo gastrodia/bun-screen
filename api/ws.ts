@@ -3,17 +3,26 @@
 // ⚠️ experimental_upgradeWebSocket 是实验性 API：只在 Vercel 线上生效，且未来可能变动。
 //    本地开发请用 `bun run index.ts`（内存版单机服务器），不要依赖 `vercel dev` 的 WS 升级。
 //
-// 路由约定见 lib/hub.ts 的 channels。服务端不保存 user 状态：每个 socket 的
-// 角色 / 房间 / 用户信息存在本地 meta 里，断开时据此 publish leave / close。
+// 关键约束：Vercel 函数 ~60s 被回收，WS 必断。但 WebRTC 媒体是 P2P，断开后画面仍在，
+// 因此 WS 只是「随时可断、可重连」的信令通道：
+//   - WS 断开「不」判定离开，也「不」广播 close/leave（避免回收时误踢对端）。
+//   - 在场用带 TTL 的 Redis key 表示，靠客户端心跳续期；真正离开后 TTL 到期才算走。
+//   - 主播重连后按名册给「漏掉的」观众补发 offer；观众重连静默续期，不重复协商。
 
 import {experimental_upgradeWebSocket, type WebSocketData} from '@vercel/functions'
 import {
   subscribe,
   unsubscribe,
   publish,
-  addRoom,
-  removeRoom,
-  hasRoom,
+  createRoom,
+  deleteRoom,
+  refreshRoom,
+  roomExists,
+  joinRoom,
+  refreshViewer,
+  listViewers,
+  viewerAlive,
+  dropViewer,
   channels,
 } from '../lib/hub'
 
@@ -27,6 +36,7 @@ interface Meta {
   roomId?: string
   userId?: string
   username?: string
+  hostToken?: string
   channels: Set<string>
 }
 
@@ -62,33 +72,78 @@ export function GET() {
       const m = metas.get(ws)!
 
       switch (type) {
+        // 主播开播 / 重连续期（幂等，靠 hostToken 识别同一主播）
         case 'create': {
-          const {roomId, roomName, cover} = data
-          if (!roomId || !roomName) return send(ws, 'error', {message: '房间信息不完整'})
-          if (await hasRoom(roomId)) return send(ws, 'error', {message: '房间已存在'})
-          await addRoom(roomId, roomName, cover)
+          const {roomId, roomName, cover, hostToken} = data
+          if (!roomId || !roomName || !hostToken) return send(ws, 'error', {message: '房间信息不完整'})
+          const res = await createRoom(roomId, roomName, cover, hostToken)
+          if (!res.ok) return send(ws, 'error', {message: res.reason})
           m.role = 'host'
           m.roomId = roomId
+          m.hostToken = hostToken
           listen(ws, channels.roomHost(roomId))
           listen(ws, channels.roomAll(roomId))
-          publish(channels.rooms(), 'updateRooms', {roomId, type: 'create'})
+          if (res.created) publish(channels.rooms(), 'updateRooms', {roomId, type: 'create'})
+          // 把当前在场名册发回，主播给「自己还没有 peer 的」观众补发 offer
+          // （覆盖回收间隙里加入、joined 广播丢失的观众）
+          send(ws, 'roster', {viewers: await listViewers(roomId)})
           break
         }
 
+        // 观众进入 / 重连续期
         case 'join': {
           const {roomId, userId, username} = data
           if (!roomId || !userId) return send(ws, 'error', {message: '房间或用户信息缺失'})
+          const name = username || '匿名用户'
           m.role = 'viewer'
           m.roomId = roomId
           m.userId = userId
-          m.username = username || '匿名用户'
-          // 即使房间暂不存在也先订阅，以便收到后续 create 广播再重连进入
+          m.username = name
           listen(ws, channels.rooms())
           listen(ws, channels.user(userId))
-          if (!(await hasRoom(roomId))) return send(ws, 'error', {message: '房间不存在或已关闭'})
+          if (!(await roomExists(roomId))) return send(ws, 'error', {message: '房间不存在或已关闭'})
           listen(ws, channels.roomAll(roomId))
-          publish(channels.roomHost(roomId), 'joined', {userId, username: m.username})
+          const {resumed} = await joinRoom(roomId, userId, name)
+          // 仅「首次进入」通知主播发 offer；重连续期不重复协商（P2P 仍在）
+          if (!resumed) publish(channels.roomHost(roomId), 'joined', {userId, username: name})
           send(ws, 'success', {message: '加入房间成功'})
+          break
+        }
+
+        // 心跳：续期在场 TTL，并探测对端是否真的离开
+        case 'heartbeat': {
+          if (m.role === 'host' && m.roomId) {
+            await refreshRoom(m.roomId)
+            for (const v of await listViewers(m.roomId)) {
+              if (await viewerAlive(m.roomId, v.userId)) continue
+              await dropViewer(m.roomId, v.userId) // 观众 TTL 过期 = 真离开
+              send(ws, 'leave', {userId: v.userId, username: v.username, message: `${v.username}(${v.userId}) 离开房间`})
+            }
+          } else if (m.role === 'viewer' && m.roomId && m.userId) {
+            await refreshViewer(m.roomId, m.userId)
+            if (!(await roomExists(m.roomId))) {
+              send(ws, 'close', {roomId: m.roomId, message: '房间已关闭'}) // 主播 TTL 过期 = 真关播
+            }
+          }
+          break
+        }
+
+        // 主播主动关播
+        case 'closeRoom': {
+          const {roomId} = data
+          if (!roomId) break
+          await deleteRoom(roomId)
+          publish(channels.roomAll(roomId), 'close', {roomId, message: `房间 ${roomId} 已关闭`})
+          publish(channels.rooms(), 'updateRooms', {roomId, type: 'close'})
+          break
+        }
+
+        // 观众主动离开
+        case 'leaveRoom': {
+          const {roomId, userId} = data
+          if (!roomId || !userId) break
+          await dropViewer(roomId, userId)
+          publish(channels.roomHost(roomId), 'leave', {userId, username: m.username, message: `${m.username}(${userId}) 离开房间`})
           break
         }
 
@@ -128,26 +183,13 @@ export function GET() {
       }
     })
 
-    const cleanup = async () => {
+    // WS 断开只清「本实例的本地路由订阅」，不做任何破坏性广播——
+    // 断开默认视为「将要重连」，真正离开由 TTL 到期 + 心跳探测处理。
+    const cleanup = () => {
       const m = metas.get(ws)
       if (!m) return
       metas.delete(ws)
       for (const ch of m.channels) unsubscribe(ch, ws)
-
-      if (m.role === 'host' && m.roomId) {
-        await removeRoom(m.roomId)
-        publish(channels.roomAll(m.roomId), 'close', {
-          roomId: m.roomId,
-          message: `房间 ${m.roomId} 已关闭`,
-        })
-        publish(channels.rooms(), 'updateRooms', {roomId: m.roomId, type: 'close'})
-      } else if (m.role === 'viewer' && m.roomId && m.userId) {
-        publish(channels.roomHost(m.roomId), 'leave', {
-          userId: m.userId,
-          username: m.username,
-          message: `用户 ${m.username}(${m.userId}) 离开了房间`,
-        })
-      }
     }
 
     ws.on('close', cleanup)

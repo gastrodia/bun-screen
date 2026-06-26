@@ -144,6 +144,10 @@
             this.cover = ''
             this.danmaku = document.getElementById('danmaku')
             this.manualClose = false
+            // 信令通道随时可断可重连；hostToken 用于重连时被服务端识别为同一主播
+            this.hostToken = (crypto.randomUUID?.() || generateClientId())
+            this.heartbeatTimer = null
+            this.reconnectTimer = null
             this.setMessage = makeMessageAppender(this.messageContainer)
             this.rtcConfig = {
                 iceServers: [
@@ -160,29 +164,13 @@
         messageHandler = {
             joined: async (data) => {
                 this.setMessage(`欢迎 ${data.username}(${data.userId}) 加入房间`)
-
-                // 给新加入的用户发送offer
-                const peer = new RTCPeerConnection(this.rtcConfig)
-                this.stream.getTracks().forEach(track => peer.addTrack(track, this.stream))
-                peer.onicecandidate = (e) => {
-                    if (e.candidate) {
-                        this.sendMessage('icecandidate', {
-                            candidate: e.candidate,
-                            userId: data.userId,
-                            roomId: this.roomId
-                        })
-                    }
+                await this.offerTo(data.userId)
+            },
+            // 重连后服务端回发当前在场名册，给「自己还没建立连接的」观众补发 offer
+            roster: async (data) => {
+                for (const {userId} of (data.viewers || [])) {
+                    if (!this.peers.has(userId)) await this.offerTo(userId)
                 }
-
-                const offer = await peer.createOffer()
-                await peer.setLocalDescription(offer)
-                this.sendMessage('offer', {
-                    offer,
-                    userId: data.userId,
-                    roomId: this.roomId
-                })
-
-                this.peers.set(data.userId, peer)
             },
             leave: (data) => {
                 const li = document.createElement('li')
@@ -229,6 +217,52 @@
                 this.setMessage('连接未就绪，无法发送消息'))
         }
 
+        async offerTo(userId) {
+            if (!this.stream) return
+            const peer = new RTCPeerConnection(this.rtcConfig)
+            this.peers.set(userId, peer)
+            this.stream.getTracks().forEach(track => peer.addTrack(track, this.stream))
+            peer.onicecandidate = (e) => {
+                if (e.candidate) {
+                    this.sendMessage('icecandidate', {candidate: e.candidate, userId, roomId: this.roomId})
+                }
+            }
+            const offer = await peer.createOffer()
+            await peer.setLocalDescription(offer)
+            this.sendMessage('offer', {offer, userId, roomId: this.roomId})
+        }
+
+        // 建立信令连接（首次开播与重连共用）。媒体流与 peers 不在这里动。
+        connect() {
+            this.socket = new WebSocket(this.socketUrl)
+            this.socket.onopen = this.socketOnOpen.bind(this)
+            this.socket.onmessage = this.socketOnMessage.bind(this)
+            this.socket.onerror = this.socketOnError.bind(this)
+            this.socket.onclose = this.socketOnClose.bind(this)
+        }
+
+        startHeartbeat() {
+            this.stopHeartbeat()
+            // 续期在场 TTL，并尽量延后空闲超时
+            this.heartbeatTimer = setInterval(() => this.sendMessage('heartbeat', {}), 25000)
+        }
+
+        stopHeartbeat() {
+            if (this.heartbeatTimer) {
+                clearInterval(this.heartbeatTimer)
+                this.heartbeatTimer = null
+            }
+        }
+
+        // Vercel 函数 ~60s 回收导致信令断开：保留媒体与 peers，静默重连后重新登记房间
+        scheduleReconnect() {
+            if (this.reconnectTimer || !this.isSharing) return
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null
+                if (this.isSharing) this.connect()
+            }, 500)
+        }
+
         inputRoomName() {
             while (!this.roomName) {
                 this.roomName = prompt('请输入')
@@ -266,6 +300,14 @@
             // 避免重复清理（手动关闭 + onclose 回调）
             if (this.manualClose) return
             if (!this.stream) return
+            this.stopHeartbeat()
+            if (this.reconnectTimer) {
+                clearTimeout(this.reconnectTimer)
+                this.reconnectTimer = null
+            }
+            this.isSharing = false
+            // 主动关播：通知服务端删房并广播给观众，再关闭信令
+            this.sendMessage('closeRoom', {roomId: this.roomId})
             this.stream.getTracks().forEach(track => track.stop())
             this.stream = null
             await this.preview.pause()
@@ -303,15 +345,11 @@
 
             this.cover = this.captureCover()
 
-            this.socket = new WebSocket(this.socketUrl)
-            this.socket.onopen = this.socketOnOpen.bind(this)
-            this.socket.onmessage = this.socketOnMessage.bind(this)
-            this.socket.onerror = this.socketOnError.bind(this)
-            this.socket.onclose = this.socketOnClose.bind(this)
+            this.isSharing = true
+            this.connect()
 
             this.setMessage(`房间 ${this.roomName}(${this.roomId}) 已创建`)
 
-            this.isSharing = true
             this.button.textContent = '停止共享'
         }
 
@@ -332,8 +370,10 @@
             this.sendMessage('create', {
                 roomId: this.roomId,
                 roomName: this.roomName,
-                cover: this.cover
+                cover: this.cover,
+                hostToken: this.hostToken
             })
+            this.startHeartbeat()
         }
 
         socketOnMessage(e) {
@@ -341,17 +381,18 @@
         }
 
         socketOnError() {
-            this.setMessage('连接异常，已尝试关闭共享')
-            this.stopShare()
+            // 由随后的 onclose 触发静默重连，不在这里拆流
         }
 
         socketOnClose() {
+            this.stopHeartbeat()
             if (this.manualClose) {
                 // 手动关闭触发的 onclose，仅重置标记
                 this.manualClose = false
                 return
             }
-            this.stopShare()
+            // 信令断开但直播仍在：保留媒体与 peers，静默重连
+            this.scheduleReconnect()
         }
 
         danmakuSubmit(e) {

@@ -36,4 +36,14 @@ bun index.ts   # http://localhost:3000
 > ⚠️ `experimental_upgradeWebSocket` 仍是 Vercel 公测中的实验性 API，只在 Vercel
 > 线上生效、未来可能变动。首次部署后请在 preview 环境实测 `/api/ws` 能否正常握手。
 
+### 关于「直播一会儿就断」
+
+Vercel 函数有 `maxDuration` 上限（Hobby ~60s），到点 WebSocket 必被回收。但 WebRTC
+媒体是 P2P 直传的，信令断开后画面仍在，所以这里把信令通道当成「随时可断、可重连」：
+
+- 信令断开 **不拆媒体流**，客户端静默重连，主播重连后按服务端回发的「在场名册」给漏掉的观众补发 offer。
+- 是否在场用带 TTL 的 Redis key 表示（`GRACE_SECONDS`），靠客户端心跳（~25s）续期；
+  WS 断开不再判定离开，避免回收瞬间误广播 `close`/`leave` 把对端踢掉。
+- 真正离开（关页面）后 TTL 到期，由对端心跳探测出来再清理。
+
 ![](./demo.png)

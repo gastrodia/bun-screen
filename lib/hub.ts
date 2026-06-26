@@ -84,27 +84,102 @@ export function publish(channel: string, type: string, data: Record<string, unkn
   getPub().publish(channel, JSON.stringify({type, data}))
 }
 
-// ── 房间登记表（供 /api/rooms 列表 + 存在性校验）────────────────────────────
-const ROOMS_KEY = 'rooms'
+// ── 房间 / 在场登记（TTL 存在性，靠客户端心跳续期）──────────────────────────
+//
+// Vercel 函数 ~60s 就被回收，WS 必断；但 WebRTC 媒体是 P2P，断开后画面仍在。
+// 所以「是否在场」不能用 WS 断开判定，改用带 TTL 的 Redis key：
+//   - 客户端每 HEARTBEAT 秒续期一次；真正离开（关页面）后 TTL 到期才算走人。
+//   - GRACE_SECONDS 要明显大于「回收间隔 + 重连耗时」，回收重连期间 key 不会过期。
+const GRACE_SECONDS = 80
 
-export async function addRoom(roomId: string, name: string, cover?: string) {
-  await getPub().hset(ROOMS_KEY, roomId, JSON.stringify({name, cover}))
+const ROOMS_KEY = 'rooms' // 房间 id 索引集合（懒清理）
+const roomKey = (roomId: string) => `room:${roomId}`
+const viewersKey = (roomId: string) => `viewers:${roomId}` // hash: userId -> username
+const presenceKey = (roomId: string, userId: string) => `presence:${roomId}:${userId}`
+
+interface RoomRecord {
+  name: string
+  cover?: string
+  hostToken: string
 }
 
-export async function removeRoom(roomId: string) {
-  await getPub().hdel(ROOMS_KEY, roomId)
+// 主播开播 / 重连续期。hostToken 校验防止他人占用同名房间。
+// 返回 created=首次创建，resumed=同一主播重连续期。
+export async function createRoom(roomId: string, name: string, cover: string | undefined, hostToken: string) {
+  const pub = getPub()
+  const existing = await pub.get(roomKey(roomId))
+  if (existing) {
+    const rec = JSON.parse(existing) as RoomRecord
+    if (rec.hostToken !== hostToken) return {ok: false as const, reason: '房间已存在'}
+    await pub.set(roomKey(roomId), existing, 'EX', GRACE_SECONDS) // 续期，数据不变
+    return {ok: true as const, resumed: true}
+  }
+  const rec: RoomRecord = {name, cover, hostToken}
+  await pub.set(roomKey(roomId), JSON.stringify(rec), 'EX', GRACE_SECONDS)
+  await pub.sadd(ROOMS_KEY, roomId)
+  return {ok: true as const, created: true}
 }
 
-export async function hasRoom(roomId: string) {
-  return (await getPub().hexists(ROOMS_KEY, roomId)) === 1
+// 主播心跳：续期房间 TTL
+export async function refreshRoom(roomId: string) {
+  await getPub().expire(roomKey(roomId), GRACE_SECONDS)
+}
+
+export async function roomExists(roomId: string) {
+  return (await getPub().exists(roomKey(roomId))) === 1
+}
+
+// 主播主动关播：删房 + 清在场
+export async function deleteRoom(roomId: string) {
+  const pub = getPub()
+  await pub.del(roomKey(roomId), viewersKey(roomId))
+  await pub.srem(ROOMS_KEY, roomId)
 }
 
 export async function listRooms() {
-  const all = await getPub().hgetall(ROOMS_KEY)
-  return Object.entries(all).map(([id, raw]) => {
-    const {name, cover} = JSON.parse(raw) as {name: string; cover?: string}
-    return {id, name, cover}
-  })
+  const pub = getPub()
+  const ids = await pub.smembers(ROOMS_KEY)
+  const rooms: Array<{id: string; name: string; cover?: string}> = []
+  for (const id of ids) {
+    const raw = await pub.get(roomKey(id))
+    if (!raw) {
+      await pub.srem(ROOMS_KEY, id) // 已过期，懒清理
+      continue
+    }
+    const {name, cover} = JSON.parse(raw) as RoomRecord
+    rooms.push({id, name, cover})
+  }
+  return rooms
+}
+
+// 观众进入 / 重连续期。返回 resumed=presence 仍在（重连，主播已有连接，不必重新协商）。
+export async function joinRoom(roomId: string, userId: string, username: string) {
+  const pub = getPub()
+  const existed = (await pub.exists(presenceKey(roomId, userId))) === 1
+  await pub.set(presenceKey(roomId, userId), '1', 'EX', GRACE_SECONDS)
+  await pub.hset(viewersKey(roomId), userId, username)
+  return {resumed: existed}
+}
+
+// 观众心跳：续期 presence
+export async function refreshViewer(roomId: string, userId: string) {
+  await getPub().expire(presenceKey(roomId, userId), GRACE_SECONDS)
+}
+
+// 当前在场观众名册（供主播重连后补发 offer 给漏掉的观众）
+export async function listViewers(roomId: string) {
+  const all = await getPub().hgetall(viewersKey(roomId))
+  return Object.entries(all).map(([userId, username]) => ({userId, username}))
+}
+
+export async function viewerAlive(roomId: string, userId: string) {
+  return (await getPub().exists(presenceKey(roomId, userId))) === 1
+}
+
+export async function dropViewer(roomId: string, userId: string) {
+  const pub = getPub()
+  await pub.hdel(viewersKey(roomId), userId)
+  await pub.del(presenceKey(roomId, userId))
 }
 
 // ── 频道命名 ────────────────────────────────────────────────────────────────

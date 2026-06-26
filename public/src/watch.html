@@ -144,6 +144,8 @@
             this.username = params.get('uname')
             this.userId = params.get('uid') || generateClientId()
             this.danmaku = document.getElementById('danmaku')
+            this.heartbeatTimer = null
+            this.reconnectTimer = null
             this.rtcConfig = {
                 iceServers: [
                     {urls: 'stun:stun.l.google.com:19302'}
@@ -186,8 +188,9 @@
                 this.setMessage(e.message)
             },
             close: (e) => {
+                // 服务端确认房间真的关闭（主播 TTL 过期/主动关播）：彻底清理，不再重连
                 this.setMessage(e.message)
-                this.cleanupConnections(false)
+                this.cleanupConnections()
             },
             icecandidate: (data) => {
                 if (!this.peer) return
@@ -272,7 +275,12 @@
         async enterRoom() {
             // if (!this.roomId) return
             this.cleanupConnections()
-            this.socket = new WebSocket(this.socketUrl)
+            this.createPeer()
+            this.connectSocket()
+        }
+
+        // 建立 RTCPeerConnection（媒体流不随信令断开而拆除，故与 socket 分开）
+        createPeer() {
             this.peer = new RTCPeerConnection(this.rtcConfig)
             // 确保协商时有可接收的媒体描述
             this.peer.addTransceiver('video', {direction: 'recvonly'})
@@ -280,7 +288,6 @@
                 this.video.srcObject = e.streams[0]
                 this.video.play().catch(this.play.bind(this))
             }
-
             this.peer.onicecandidate = (e) => {
                 if (e.candidate) {
                     this.sendMessage('icecandidate', {
@@ -290,10 +297,36 @@
                     })
                 }
             }
+        }
+
+        // 建立信令连接（首次进入与重连共用）
+        connectSocket() {
+            this.socket = new WebSocket(this.socketUrl)
             this.socket.onopen = this.socketOnOpen.bind(this)
             this.socket.onmessage = this.socketOnMessage.bind(this)
             this.socket.onerror = this.socketOnError.bind(this)
             this.socket.onclose = this.socketOnClose.bind(this)
+        }
+
+        startHeartbeat() {
+            this.stopHeartbeat()
+            this.heartbeatTimer = setInterval(() => this.sendMessage('heartbeat', {}), 25000)
+        }
+
+        stopHeartbeat() {
+            if (this.heartbeatTimer) {
+                clearInterval(this.heartbeatTimer)
+                this.heartbeatTimer = null
+            }
+        }
+
+        // Vercel 函数 ~60s 回收导致信令断开：保留 peer 与视频，静默重连后重新 join
+        scheduleReconnect() {
+            if (this.reconnectTimer || !this.peer) return
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null
+                if (this.peer && this.roomId) this.connectSocket()
+            }, 500)
         }
 
         // 手动点击播放
@@ -320,6 +353,7 @@
                 userId: this.userId,
                 username: this.username
             })
+            this.startHeartbeat()
         }
 
         socketOnMessage(e) {
@@ -332,26 +366,41 @@
         }
 
         socketOnError() {
-            this.cleanupConnections()
-            this.setMessage('连接异常，已退出房间')
+            // 由随后的 onclose 触发静默重连，不在这里拆 peer
         }
 
         socketOnClose() {
-            this.cleanupConnections(false)
-            this.setMessage('房间连接已关闭')
+            // 仅「当前在用的 socket」自发断开（如 Vercel 回收）才会走到这里——
+            // 主动废弃的旧 socket 已在 detachSocket 里摘掉回调，不会触发。
+            this.stopHeartbeat()
+            this.socket = null
+            // 信令断开但仍在观看：保留 peer 与视频，静默重连后重新 join
+            this.scheduleReconnect()
         }
 
-        cleanupConnections(closeSocket = true) {
+        // 摘掉 socket 的全部回调，使其后续事件不再影响实例（避免旧 socket 误触发重连）
+        detachSocket(sock) {
+            if (!sock) return
+            sock.onopen = sock.onmessage = sock.onerror = sock.onclose = null
+        }
+
+        cleanupConnections() {
+            this.stopHeartbeat()
+            if (this.reconnectTimer) {
+                clearTimeout(this.reconnectTimer)
+                this.reconnectTimer = null
+            }
             this.video.srcObject?.getTracks().forEach(track => track.stop())
             this.video.srcObject = null
             if (this.peer) {
                 this.peer.close()
                 this.peer = null
             }
-            if (closeSocket && this.socket) {
+            if (this.socket) {
+                this.detachSocket(this.socket)
                 this.socket.close()
+                this.socket = null
             }
-            this.socket = null
         }
 
         registerEvent() {
