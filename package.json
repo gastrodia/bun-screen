@@ -5,6 +5,10 @@
     "dev": "bun run index.ts",
     "start": "bun run index.ts"
   },
+  "dependencies": {
+    "@vercel/functions": "latest",
+    "ioredis": "^5.4.1"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },

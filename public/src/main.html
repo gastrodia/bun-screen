@@ -115,20 +115,28 @@
     </div>
 </div>
 </body>
-<script>
+<script type="module">
+    import {
+        generateClientId,
+        buildWsUrl,
+        makeMessageAppender,
+        sendSocketMessage,
+        dispatchSocketMessage,
+        addIceCandidateSafe,
+        flushIceCandidates,
+    } from './shared.js'
+
     class Main {
         constructor() {
             const params = new URLSearchParams(location.search)
-            const url = new URL(location.href)
             this.preview = document.getElementById('preview')
-            const wsProtocol = url.protocol === 'https:' ? 'wss' : 'ws'
-            this.socketUrl = `${wsProtocol}://${url.host}/ws`
+            this.socketUrl = buildWsUrl()
             this.title = document.getElementById('title')
             this.button = document.getElementById('button')
             this.shareButton = document.getElementById('share-link')
             this.messageContainer = document.querySelector('.message-list')
             this.socket = null
-            this.roomId = params.get('id') || this.generateClientId()
+            this.roomId = params.get('id') || generateClientId()
             this.roomName = params.get('name') || ''
             this.isSharing = false
             this.stream = null
@@ -136,6 +144,7 @@
             this.cover = ''
             this.danmaku = document.getElementById('danmaku')
             this.manualClose = false
+            this.setMessage = makeMessageAppender(this.messageContainer)
             this.rtcConfig = {
                 iceServers: [
                     {urls: 'stun:stun.l.google.com:19302'}
@@ -150,10 +159,7 @@
 
         messageHandler = {
             joined: async (data) => {
-                console.log('join')
-                const li = document.createElement('li')
-                li.textContent = `欢迎 ${data.username}(${data.userId}) 加入房间`
-                this.setMessage(li)
+                this.setMessage(`欢迎 ${data.username}(${data.userId}) 加入房间`)
 
                 // 给新加入的用户发送offer
                 const peer = new RTCPeerConnection(this.rtcConfig)
@@ -179,7 +185,6 @@
                 this.peers.set(data.userId, peer)
             },
             leave: (data) => {
-                console.log('leave')
                 const li = document.createElement('li')
                 li.classList.add('leave')
                 li.textContent = `${data.username}(${data.userId}) 离开房间`
@@ -191,18 +196,17 @@
                 }
             },
             answer: async (data) => {
-                console.log('answer')
                 const {answer, userId} = data
                 const peer = this.peers.get(userId)
                 if (!peer) return
                 await peer.setRemoteDescription(answer)
+                flushIceCandidates(peer)
             },
             icecandidate: (data) => {
-                console.log('icecandidate')
                 const {candidate, userId} = data
                 const peer = this.peers.get(userId)
                 if (!peer) return
-                peer.addIceCandidate(new RTCIceCandidate(candidate))
+                addIceCandidateSafe(peer, candidate)
             },
             danmaku: (data) => {
                 const li = document.createElement('li')
@@ -221,20 +225,8 @@
         }
 
         sendMessage(type, data) {
-            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-                const li = document.createElement('li')
-                li.textContent = '连接未就绪，无法发送消息'
-                this.setMessage(li)
-                return
-            }
-            this.socket.send(JSON.stringify({
-                type,
-                data
-            }))
-        }
-
-        generateClientId() {
-            return Math.random().toString().substring(2, 9)
+            sendSocketMessage(this.socket, type, data, () =>
+                this.setMessage('连接未就绪，无法发送消息'))
         }
 
         inputRoomName() {
@@ -256,11 +248,8 @@
                 const url = new URL(`${location.origin}/src/watch.html`)
                 url.searchParams.set('id', this.roomId)
                 url.searchParams.set('name', this.roomName)
-                navigator.clipboard.writeText(url.href).catch(() => {
-                    const li = document.createElement('li')
-                    li.textContent = '复制分享链接失败，请手动复制地址栏'
-                    this.setMessage(li)
-                })
+                navigator.clipboard.writeText(url.href).catch(() =>
+                    this.setMessage('复制分享链接失败，请手动复制地址栏'))
             })
             window.addEventListener('beforeunload', () => {
                 if (this.isSharing) {
@@ -287,9 +276,7 @@
             this.peers.forEach(peer => peer.close())
             this.peers.clear()
 
-            const li = document.createElement('li')
-            li.textContent = `房间 ${this.roomName}(${this.roomId}) 已关闭`
-            this.setMessage(li)
+            this.setMessage(`房间 ${this.roomName}(${this.roomId}) 已关闭`)
 
             this.isSharing = false
             this.button.textContent = '开始共享'
@@ -302,9 +289,7 @@
                     audio: false
                 })
             } catch (err) {
-                const li = document.createElement('li')
-                li.textContent = '未授权或取消屏幕共享'
-                this.setMessage(li)
+                this.setMessage('未授权或取消屏幕共享')
                 return
             }
 
@@ -313,19 +298,10 @@
             })
 
             this.preview.srcObject = this.stream
-            await this.preview.play().catch(() => {
-                const li = document.createElement('li')
-                li.textContent = '自动播放被阻止，请手动点击播放'
-                this.setMessage(li)
-            })
+            await this.preview.play().catch(() =>
+                this.setMessage('自动播放被阻止，请手动点击播放'))
 
-            // 获取第一帧作为封面
-            const canvas = document.createElement('canvas')
-            const ctx = canvas.getContext('2d')
-            canvas.width = this.preview.videoWidth
-            canvas.height = this.preview.videoHeight
-            ctx.drawImage(this.preview, 0, 0, canvas.width, canvas.height)
-            this.cover = canvas.toDataURL('image/png')
+            this.cover = this.captureCover()
 
             this.socket = new WebSocket(this.socketUrl)
             this.socket.onopen = this.socketOnOpen.bind(this)
@@ -333,12 +309,23 @@
             this.socket.onerror = this.socketOnError.bind(this)
             this.socket.onclose = this.socketOnClose.bind(this)
 
-            const li = document.createElement('li')
-            li.textContent = `房间 ${this.roomName}(${this.roomId}) 已创建`
-            this.setMessage(li)
+            this.setMessage(`房间 ${this.roomName}(${this.roomId}) 已创建`)
 
             this.isSharing = true
             this.button.textContent = '停止共享'
+        }
+
+        // 取首帧并缩放成缩略图作为房间封面，避免把整张全屏 PNG 塞进列表接口
+        captureCover() {
+            const maxWidth = 320
+            const {videoWidth, videoHeight} = this.preview
+            if (!videoWidth || !videoHeight) return ''
+            const scale = Math.min(1, maxWidth / videoWidth)
+            const canvas = document.createElement('canvas')
+            canvas.width = Math.round(videoWidth * scale)
+            canvas.height = Math.round(videoHeight * scale)
+            canvas.getContext('2d').drawImage(this.preview, 0, 0, canvas.width, canvas.height)
+            return canvas.toDataURL('image/jpeg', 0.6)
         }
 
         socketOnOpen() {
@@ -350,17 +337,11 @@
         }
 
         socketOnMessage(e) {
-            const payload = JSON.parse(e.data)
-            const {data, type} = payload
-            const handler = this.messageHandler[type]
-            if (!handler) return
-            handler(data)
+            dispatchSocketMessage(this.messageHandler, e)
         }
 
         socketOnError() {
-            const li = document.createElement('li')
-            li.textContent = '连接异常，已尝试关闭共享'
-            this.setMessage(li)
+            this.setMessage('连接异常，已尝试关闭共享')
             this.stopShare()
         }
 
@@ -371,11 +352,6 @@
                 return
             }
             this.stopShare()
-        }
-
-        setMessage(li) {
-            this.messageContainer.appendChild(li)
-            this.messageContainer.scrollTop = this.messageContainer.scrollHeight
         }
 
         danmakuSubmit(e) {

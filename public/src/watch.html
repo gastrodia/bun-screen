@@ -119,21 +119,30 @@
         </div>
     </div>
 </div>
-<script>
+<script type="module">
+    import {
+        generateClientId,
+        buildWsUrl,
+        makeMessageAppender,
+        sendSocketMessage,
+        dispatchSocketMessage,
+        addIceCandidateSafe,
+        flushIceCandidates,
+    } from './shared.js'
+
     class Watch {
         constructor() {
             const params = new URLSearchParams(location.search)
-            const url = new URL(location.href)
             this.video = document.getElementById('preview')
             this.title = document.getElementById('title')
             this.messageContainer = document.querySelector('.message-list')
+            this.setMessage = makeMessageAppender(this.messageContainer)
             this.socket = null
-            const wsProtocol = url.protocol === 'https:' ? 'wss' : 'ws'
-            this.socketUrl = `${wsProtocol}://${url.host}/ws`
+            this.socketUrl = buildWsUrl()
             this.roomContainer = document.querySelector('.room-list')
             this.peer = null
             this.username = params.get('uname')
-            this.userId = params.get('uid') || this.generateClientId()
+            this.userId = params.get('uid') || generateClientId()
             this.danmaku = document.getElementById('danmaku')
             this.rtcConfig = {
                 iceServers: [
@@ -157,12 +166,11 @@
             offer: async (data) => {
                 const {offer} = data
                 if (!this.peer) {
-                    const li = document.createElement('li')
-                    li.textContent = '连接尚未准备好，无法处理 offer'
-                    this.setMessage(li)
+                    this.setMessage('连接尚未准备好，无法处理 offer')
                     return
                 }
                 await this.peer.setRemoteDescription(offer)
+                flushIceCandidates(this.peer)
                 const answer = await this.peer.createAnswer()
                 await this.peer.setLocalDescription(answer)
                 this.sendMessage('answer', {
@@ -171,29 +179,19 @@
                     roomId: this.roomId
                 })
             },
-            answer: (data) => {
-                console.log(data)
-            },
             error: (e) => {
-                const li = document.createElement('li')
-                li.textContent = e.message
-                this.setMessage(li)
+                this.setMessage(e.message)
             },
             success: (e) => {
-                const li = document.createElement('li')
-                li.textContent = e.message
-                this.setMessage(li)
+                this.setMessage(e.message)
             },
             close: (e) => {
-                const li = document.createElement('li')
-                li.textContent = e.message
-                this.setMessage(li)
-
+                this.setMessage(e.message)
                 this.cleanupConnections(false)
             },
-            icecandidate: async (data) => {
+            icecandidate: (data) => {
                 if (!this.peer) return
-                await this.peer.addIceCandidate(data.candidate)
+                addIceCandidateSafe(this.peer, data.candidate)
             },
             updateRooms: (data) => {
                 this.getRoom()
@@ -226,19 +224,8 @@
             if (this.roomId) {
                 await this.enterRoom()
             } else {
-                const li = document.createElement('li')
-                li.textContent = '请选择房间后再进入'
-                this.setMessage(li)
+                this.setMessage('请选择房间后再进入')
             }
-        }
-
-        setMessage(li) {
-            this.messageContainer.appendChild(li)
-            this.messageContainer.scrollTop = this.messageContainer.scrollHeight
-        }
-
-        generateClientId() {
-            return Math.random().toString().substring(2, 9)
         }
 
         inputUsername() {
@@ -278,9 +265,7 @@
                 }
                 this.roomContainer.appendChild(fragment)
             } catch (err) {
-                const li = document.createElement('li')
-                li.textContent = '房间列表获取失败，请稍后重试'
-                this.setMessage(li)
+                this.setMessage('房间列表获取失败，请稍后重试')
             }
         }
 
@@ -338,38 +323,22 @@
         }
 
         socketOnMessage(e) {
-            const payload = JSON.parse(e.data)
-            const {data, type} = payload
-            const handler = this.messageHandler[type]
-            if (!handler) return
-            handler(data)
+            dispatchSocketMessage(this.messageHandler, e)
         }
 
         sendMessage(type, data) {
-            if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-                const li = document.createElement('li')
-                li.textContent = '连接未就绪，消息未发送'
-                this.setMessage(li)
-                return
-            }
-            this.socket.send(JSON.stringify({
-                type,
-                data
-            }))
+            sendSocketMessage(this.socket, type, data, () =>
+                this.setMessage('连接未就绪，消息未发送'))
         }
 
         socketOnError() {
             this.cleanupConnections()
-            const li = document.createElement('li')
-            li.textContent = '连接异常，已退出房间'
-            this.setMessage(li)
+            this.setMessage('连接异常，已退出房间')
         }
 
         socketOnClose() {
             this.cleanupConnections(false)
-            const li = document.createElement('li')
-            li.textContent = '房间连接已关闭'
-            this.setMessage(li)
+            this.setMessage('房间连接已关闭')
         }
 
         cleanupConnections(closeSocket = true) {
